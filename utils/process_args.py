@@ -153,6 +153,24 @@ def parser_gen():
         default=False,
         help="act-order in GPTQ",
     )
+    parser.add_argument(
+        "--gptq_batch_size",
+        type=int,
+        default=1,
+        help="Batch size used in GPTQ forward passes. Set to 1 for legacy behavior.",
+    )
+    parser.add_argument(
+        "--rank_eora",
+        type=int,
+        default=0,
+        help="Rank hyperparameter for EoRA branch. Keep 0 to disable.",
+    )
+    parser.add_argument(
+        "--rank_lorc",
+        type=int,
+        default=0,
+        help="Rank hyperparameter for LoRC branch. Keep 0 to disable.",
+    )
 
     # General Quantization Arguments
     parser.add_argument(

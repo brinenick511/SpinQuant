@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import tqdm
 
+from eval_utils import rocob_utils
 from utils import quant_utils, utils
 
 
@@ -221,6 +222,10 @@ def gptq_fwrd(model, dataloader, dev, args):
     position_ids = cache["position_ids"]
 
     quantizers = {}
+    gptq_batch_size = max(1, getattr(args, "gptq_batch_size", 1))
+    rank_eora = int(getattr(args, "rank_eora", 0))
+    rank_lorc = int(getattr(args, "rank_lorc", 0))
+    use_rocob_update = rank_eora > 0 or rank_lorc > 0
     sequential = [
         [
             "self_attn.k_proj.module",
@@ -266,9 +271,10 @@ def gptq_fwrd(model, dataloader, dev, args):
             handles = []
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
+            for s in range(0, args.nsamples, gptq_batch_size):
+                e = min(s + gptq_batch_size, args.nsamples)
+                outs[s:e] = layer(
+                    inps[s:e],
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                 )[0]
@@ -277,6 +283,10 @@ def gptq_fwrd(model, dataloader, dev, args):
 
             for name in subset:
                 layer_w_groupsize = args.w_groupsize
+                if use_rocob_update:
+                    # H is deleted inside fasterquant(), so cache it before quantization.
+                    H_before = gptq[name].H.detach().clone()
+                    W_before = subset[name].weight.data.detach().clone()
                 gptq[name].fasterquant(
                     percdamp=args.percdamp,
                     groupsize=layer_w_groupsize,
@@ -284,12 +294,35 @@ def gptq_fwrd(model, dataloader, dev, args):
                     static_groups=False,
                     export_to_et=args.export_to_et,
                 )
+                if use_rocob_update:
+                    Q_after = subset[name].weight.data.detach().clone()
+                    Q_updated = rocob_utils.update_q_with_h_w_q(
+                        H=H_before,
+                        W=W_before,
+                        Q=Q_after,
+                        rank_eora=rank_eora,
+                        rank_lorc=rank_lorc,
+                        layer_idx=i,
+                        module_name=name,
+                    )
+                    if Q_updated.shape != subset[name].weight.data.shape:
+                        raise ValueError(
+                            f"Q update shape mismatch for {i}.{name}: "
+                            f"got {Q_updated.shape}, expect {subset[name].weight.data.shape}"
+                        )
+                    Q_updated = Q_updated.to(
+                        device=subset[name].weight.data.device,
+                        dtype=subset[name].weight.data.dtype,
+                    )
+                    subset[name].weight.data.copy_(Q_updated)
+                    del H_before, W_before, Q_after, Q_updated
                 quantizers["model.layers.%d.%s" % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
-        for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
+        for s in range(0, args.nsamples, gptq_batch_size):
+            e = min(s + gptq_batch_size, args.nsamples)
+            outs[s:e] = layer(
+                inps[s:e],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
             )[0]
